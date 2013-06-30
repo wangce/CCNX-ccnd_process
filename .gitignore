@@ -1,0 +1,168 @@
+static void
+process_input(struct ccnd_handle *h, int fd)
+{
+    struct face *face = NULL;
+    struct face *source = NULL;
+    ssize_t res;
+    ssize_t dres;
+    ssize_t msgstart;
+    unsigned char *buf;
+    struct ccn_skeleton_decoder *d;
+    struct sockaddr_storage sstor;
+    socklen_t addrlen = sizeof(sstor);
+    struct sockaddr *addr = (struct sockaddr *)&sstor;
+    int err = 0;
+    socklen_t err_sz;
+    
+    face = hashtb_lookup(h->faces_by_fd, &fd, sizeof(fd));
+    if (face == NULL)
+        return;
+    if ((face->flags & (CCN_FACE_DGRAM | CCN_FACE_PASSIVE)) == CCN_FACE_PASSIVE) {
+        accept_connection(h, fd);
+        check_comm_file(h);
+        return;
+    }
+    err_sz = sizeof(err);
+    res = getsockopt(face->recv_fd, SOL_SOCKET, SO_ERROR, &err, &err_sz);
+    if (res >= 0 && err != 0) {
+        ccnd_msg(h, "error on face %u: %s (%d)", face->faceid, strerror(err), err);
+        if (err == ETIMEDOUT && (face->flags & CCN_FACE_CONNECTING) != 0) {
+            shutdown_client_fd(h, fd);
+            return;
+        }
+    }
+    d = &face->decoder;
+    if (face->inbuf == NULL)
+        face->inbuf = ccn_charbuf_create();
+    if (face->inbuf->length == 0)
+        memset(d, 0, sizeof(*d));
+    buf = ccn_charbuf_reserve(face->inbuf, 8800);
+    memset(&sstor, 0, sizeof(sstor));
+    res = recvfrom(face->recv_fd, buf, face->inbuf->limit - face->inbuf->length,
+            /* flags */ 0, addr, &addrlen);
+    if (res == -1)
+        ccnd_msg(h, "recvfrom face %u :%s (errno = %d)",
+                    face->faceid, strerror(errno), errno);
+    else if (res == 0 && (face->flags & CCN_FACE_DGRAM) == 0)
+        shutdown_client_fd(h, fd);
+    else {
+        source = get_dgram_source(h, face, addr, addrlen, (res == 1) ? 1 : 2);
+        ccnd_meter_bump(h, source->meter[FM_BYTI], res);
+        source->recvcount++;
+        source->surplus = 0; // XXX - we don't actually use this, except for some obscure messages.
+        if (res <= 1 && (source->flags & CCN_FACE_DGRAM) != 0) {
+            // XXX - If the initial heartbeat gets missed, we don't realize the locality of the face.
+            if (h->debug & 128)
+                ccnd_msg(h, "%d-byte heartbeat on %d", (int)res, source->faceid);
+            return;
+        }
+        face->inbuf->length += res;
+        msgstart = 0;
+        if (((face->flags & CCN_FACE_UNDECIDED) != 0 &&
+             face->inbuf->length >= 6 &&
+             0 == memcmp(face->inbuf->buf, "GET ", 4))) {
+            ccnd_stats_handle_http_connection(h, face);
+            return;
+        }
+        dres = ccn_skeleton_decode(d, buf, res);
+        while (d->state == 0) {
+            process_input_message(h, source,
+                                  face->inbuf->buf + msgstart,
+                                  d->index - msgstart,
+                                  (face->flags & CCN_FACE_LOCAL) != 0);
+            msgstart = d->index;
+            if (msgstart == face->inbuf->length) {
+                face->inbuf->length = 0;
+                return;
+            }
+            dres = ccn_skeleton_decode(d,
+                    face->inbuf->buf + d->index, // XXX - msgstart and d->index are the same here - use msgstart
+                    res = face->inbuf->length - d->index);  // XXX - why is res set here?
+        }
+        if ((face->flags & CCN_FACE_DGRAM) != 0) {
+            ccnd_msg(h, "protocol error on face %u, discarding %u bytes",
+                source->faceid,
+                (unsigned)(face->inbuf->length));  // XXX - Should be face->inbuf->length - d->index (or msgstart)
+            face->inbuf->length = 0;
+            /* XXX - should probably ignore this source for a while */
+            return;
+        }
+        else if (d->state < 0) {
+            ccnd_msg(h, "protocol error on face %u", source->faceid);
+            shutdown_client_fd(h, fd);
+            return;
+        }
+        if (msgstart < face->inbuf->length && msgstart > 0) {
+            /* move partial message to start of buffer */
+            memmove(face->inbuf->buf, face->inbuf->buf + msgstart,
+                face->inbuf->length - msgstart);
+            face->inbuf->length -= msgstart;
+            d->index -= msgstart;
+        }
+    }
+}
+
+static void
+process_input_message(struct ccnd_handle *h, struct face *face,
+                      unsigned char *msg, size_t size, int pdu_ok)
+{
+    struct ccn_skeleton_decoder decoder = {0};
+    struct ccn_skeleton_decoder *d = &decoder;
+    ssize_t dres;
+    enum ccn_dtag dtag;
+    
+    if ((face->flags & CCN_FACE_UNDECIDED) != 0) {
+        face->flags &= ~CCN_FACE_UNDECIDED;
+        if ((face->flags & CCN_FACE_LOOPBACK) != 0)
+            face->flags |= CCN_FACE_GG;
+        /* YYY This is the first place that we know that an inbound stream face is speaking CCNx protocol. */
+        register_new_face(h, face);
+    }
+    d->state |= CCN_DSTATE_PAUSE;
+    dres = ccn_skeleton_decode(d, msg, size);
+    if (d->state < 0)
+        abort(); /* cannot happen because of checks in caller */
+    if (CCN_GET_TT_FROM_DSTATE(d->state) != CCN_DTAG) {
+        ccnd_msg(h, "discarding unknown message; size = %lu", (unsigned long)size);
+        // XXX - keep a count?
+        return;
+    }
+    dtag = d->numval;
+    switch (dtag) {
+        case CCN_DTAG_CCNProtocolDataUnit:
+            if (!pdu_ok)
+                break;
+            size -= d->index;
+            if (size > 0)
+                size--;
+            msg += d->index;
+            if ((face->flags & (CCN_FACE_LINK | CCN_FACE_GG)) != CCN_FACE_LINK) {
+                face->flags |= CCN_FACE_LINK;
+                face->flags &= ~CCN_FACE_GG;
+                register_new_face(h, face);
+            }
+            memset(d, 0, sizeof(*d));
+            while (d->index < size) {
+                dres = ccn_skeleton_decode(d, msg + d->index, size - d->index);
+                if (d->state != 0)
+                    abort(); /* cannot happen because of checks in caller */
+                /* The pdu_ok parameter limits the recursion depth */
+                process_input_message(h, face, msg + d->index - dres, dres, 0);
+            }
+            return;
+        case CCN_DTAG_Interest:
+            process_incoming_interest(h, face, msg, size);
+            return;
+        case CCN_DTAG_ContentObject:
+            process_incoming_content(h, face, msg, size);
+            return;
+        case CCN_DTAG_SequenceNumber:
+            process_incoming_link_message(h, face, dtag, msg, size);
+            return;
+        default:
+            break;
+    }
+    ccnd_msg(h, "discarding unknown message; dtag=%u, size = %lu",
+             (unsigned)dtag,
+             (unsigned long)size);
+}
